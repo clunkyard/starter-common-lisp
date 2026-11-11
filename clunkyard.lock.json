@@ -1,0 +1,28 @@
+{
+  "version": "v2.0.0-kit.1",
+  "sdkVersion": "2.0.0",
+  "language": "common-lisp",
+  "portable": false,
+  "engine": {
+    "file": "clunkyard-engine-v2.0.0-kit.1.tar.gz",
+    "url": "https://github.com/clunkyard/game-kit/releases/download/v2.0.0-kit.1/clunkyard-engine-v2.0.0-kit.1.tar.gz",
+    "bytes": 7071301,
+    "sha256": "0b9cfa6958a952c32388602821ec4275e61400255f91b212f9c2a9220f8a0d86",
+    "expandedBytes": 33794538
+  },
+  "sdk": {
+    "file": "clunkyard-sdk-common-lisp-linux-x64-v2.0.0-kit.1.tar.gz",
+    "url": "https://github.com/clunkyard/game-kit/releases/download/v2.0.0-kit.1/clunkyard-sdk-common-lisp-linux-x64-v2.0.0-kit.1.tar.gz",
+    "bytes": 754901,
+    "sha256": "fa09294146b0a2dab7cc541bab132b758955f3bbca8465b8323aea9cd6535074",
+    "expandedBytes": 3903434
+  },
+  "rebuildBindings": [
+    "common-lisp"
+  ],
+  "tools": [
+    "node",
+    "make",
+    "sbcl"
+  ]
+}
