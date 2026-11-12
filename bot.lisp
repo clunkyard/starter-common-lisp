@@ -46,18 +46,7 @@
 
 (defun steer (towards current) (angles-clamp (/ (angles-angle-diff towards current) 45d0)))
 
-(defun calibration-work (work tick)
-  "The calibration kernel, xorshift-sqrt v1: WORK rounds of a 64-bit xorshift
-and a square-root sum."
-  (declare (type fixnum work tick))
-  (let ((x (logxor 88172645463325252 tick)) (sum 0d0))
-    (declare (type (unsigned-byte 64) x) (type double-float sum))
-    (dotimes (i work)
-      (setf x (logxor x (ldb (byte 64 0) (ash x 13)))
-            x (logxor x (ash x -7))
-            x (logxor x (ldb (byte 64 0) (ash x 17))))
-      (incf sum (sqrt (coerce (ash x -11) 'double-float))))
-    (mod (+ (floor sum) (ash x -40)) 1000000)))
+
 
 
 (defun starter-turn (bot)
@@ -102,8 +91,6 @@ and a square-root sum."
         (let ((climb (if (eq (zone-shape zone) :sphere) (angles-elevation-to position (zone-center zone)) 0d0)))
           (drive-set bot :throttle 0.8d0 :turn (angles-clamp (/ (angles-angle-diff (angles-bearing-to position (zone-center zone)) heading) 30d0))
                      :pitch-turn (angles-clamp (/ (- climb pitch) 30d0))))))
-    ;; The arena's rate calibration only; safe to delete.
-    (let ((work (raw-number bot "state.calibration.work")))
-      (when (and work (plusp work)) (status-set bot :text "WORK" :value (calibration-work (truncate work) (clock-tick bot)))))))
+    ))
 
 (run (make-robot :on-turn #'starter-turn))
