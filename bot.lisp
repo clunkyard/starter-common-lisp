@@ -1,5 +1,10 @@
 ;;;; A robot on the core binding supplied by the arena.
 ;;;; The core owns tracking, geometry, parsing and act serialization.
+;;;; Bearing is earned: a scan contact's bearing is off by up to its
+;;;; bearing-error (degrees, a fixed share of the arc), so a wide beam finds a
+;;;; robot and a narrow one aims at it. The robot narrows the beam, holds it
+;;;; on the target and aims along a line fitted through its recent sightings.
+;;;; Contacts within 120 units are exact.
 ;;;; Clunkyard robot API 2.0.0: one core under every language, the same
 ;;;; answers everywhere. Facts (a call shows its arguments):
 ;;;; match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -48,45 +53,99 @@
 
 (defun steer (towards current) (angles-clamp (/ (angles-angle-diff towards current) 45d0)))
 
+(defparameter *search-arc* 40d0) ; degrees: sweeps the circle in half a second
+(defparameter *hold-width* 60d0) ; units across at the target: it stays in the beam from tick to tick
+(defparameter *min-arc* 6d0)     ; degrees: the narrowest the beam holds
+(defparameter *window* 12)       ; ticks of sightings the aim averages
+(defparameter *sightings* 8)     ; narrow sightings in the window before a shot
+(defparameter *look-every* 40)   ; ticks between looks around the target, for a nearer robot
+(defparameter *reacquire* 10)    ; ticks to look again where a lost target was
+
 ;; Dodges taken, and the tick the current one ends.
 (defvar *dodges* 0)
 (defvar *dodge-end* 0)
+;; The last target's slot, for looking again where it was lost.
+(defvar *slot* 0)
+
+;; A straight line through the narrowest of the last *window* ticks' sightings:
+;; where the robot is now and how fast it moves, and how many sightings it rests
+;; on. Each sighting is off by its bearing-error; the line averages that out.
+(defun fit (bot slot tick)
+  (let* ((recent (remove-if-not (lambda (s) (> (sighting-tick s) (- tick *window*))) (coerce (tracker-history bot slot) 'list)))
+         (best (when recent (reduce #'min recent :key #'sighting-bearing-error)))
+         (seen (when best (remove-if-not (lambda (s) (<= (sighting-bearing-error s) (* 1.5d0 best))) recent))) ; the narrow ones
+         (n (length seen)))
+    (when (>= n 2)
+      (let* ((t0 (/ (reduce #'+ seen :key #'sighting-tick) (float n 1d0)))
+             (spread (loop for s in seen sum (expt (- (sighting-tick s) t0) 2)))
+             ;; One axis: the line's position now and its slope per tick.
+             (axis (lambda (along)
+                     (let* ((mean (/ (loop for s in seen sum (funcall along (sighting-position s))) n))
+                            (slope (/ (loop for s in seen sum (* (- (sighting-tick s) t0) (- (funcall along (sighting-position s)) mean))) spread)))
+                       (cons (+ mean (* slope (- tick t0))) (* slope (match-tick-rate bot)))))))
+        (let ((x (funcall axis #'vec3-x)) (y (funcall axis #'vec3-y)) (z (funcall axis #'vec3-z)))
+          (values (make-vec3 :x (car x) :y (car y) :z (car z))
+                  (make-vec3 :x (cdr x) :y (cdr y) :z (cdr z))
+                  n))))))
 
 (defun starter-turn (bot)
   (let* ((position (me-position bot)) (heading (me-heading bot)) (pitch (me-pitch bot))
-         (target (sensors-nearest bot)) (heard (tracker-cue bot))
+         (tick (clock-tick bot)) (target (sensors-nearest bot)) (heard (tracker-cue bot))
+         (last-seen (and (/= *slot* 0) (tracker-last-seen bot *slot*)))
          (free (and (match-is-3d bot) (zerop (vec3-z (arena-gravity bot))))))
     (drive-forces bot :brake 0.2d0)
     (cond
       (target
        (let* ((range (contact-range target)) (bearing (contact-bearing target)) (elevation (contact-elevation target))
               (throttle (cond ((> range 350) 0.7d0) ((< range 200) -0.4d0) (t 0.2d0)))
-              ;; gun-lead is the intercept if the target holds course.
-              (power (gun-power-for-flight-time bot range 1d0)) (aim (gun-lead bot target power))
-              (aim-heading (if aim (solution-heading aim) bearing)) (aim-pitch (if aim (solution-pitch aim) elevation))
-              (now (gun-aim-now bot)))
-         (drive-set bot :throttle throttle :turn (steer bearing heading) :pitch-turn (steer elevation pitch))
-         (scanner-set bot :heading bearing :arc 20d0 :pitch elevation)
-         (gun-aim bot :heading aim-heading :pitch aim-pitch)
-         (when (and (< (abs (angles-angle-diff aim-heading (direction-heading now))) 3)
-                    (< (abs (- aim-pitch (direction-pitch now))) 3) (gun-can-fire bot power 10d0))
-           (gun-fire bot :power power))
-         (status-set bot :text "TRACK" :value range)))
+              ;; Halve the beam each tick until it is *hold-width* across at the target:
+              ;; narrow enough for a precise bearing, wide enough to keep it in.
+              (hold (max *min-arc* (* (/ 180 pi) 2 (atan (/ *hold-width* 2) range))))
+              ;; In a crowd a narrow beam sees one robot. Every *look-every* ticks,
+              ;; widen it for a tick: a nearer robot it finds becomes the target.
+              (arc (if (zerop (mod tick *look-every*)) *search-arc* (max hold (min *search-arc* (/ (scan-arc (scanner-last bot)) 2)))))
+              (power (gun-power-for-flight-time bot range 1d0))
+              (noisy (> (contact-bearing-error target) 0)) (aim nil) (ready t))
+         (setf *slot* (contact-slot target))
+         ;; An exact contact: gun-lead is the intercept if the target holds course.
+         ;; A noisy one: lead the fitted line, and fire only once it rests on enough sightings.
+         (if noisy
+             (multiple-value-bind (where velocity count) (fit bot *slot* tick)
+               (setf aim (and where (gun-lead-point bot where velocity power))
+                     ready (and count (>= count *sightings*))))
+             (setf aim (gun-lead bot target power)))
+         (let ((aim-heading (if aim (solution-heading aim) bearing)) (aim-pitch (if aim (solution-pitch aim) elevation))
+               (now (gun-aim-now bot)))
+           (drive-set bot :throttle throttle :turn (steer bearing heading) :pitch-turn (steer elevation pitch))
+           (scanner-set bot :heading bearing :arc arc :pitch elevation)
+           (gun-aim bot :heading aim-heading :pitch aim-pitch)
+           (when (and ready (< (abs (angles-angle-diff aim-heading (direction-heading now))) 3)
+                      (< (abs (- aim-pitch (direction-pitch now))) 3) (gun-can-fire bot power 10d0))
+             (gun-fire bot :power power))
+           (status-set bot :text (if ready "TRACK" "NARROW") :value range))))
+      ;; Lost it: look again where it was last seen, widening the beam, before searching.
+      ((and last-seen (<= (- tick last-seen) *reacquire*))
+       (let* ((where (or (tracker-position bot *slot*) position))
+              (bearing (angles-bearing-to position where))
+              (elevation (if free (angles-elevation-to position where) 0d0)))
+         (drive-set bot :throttle 0.5d0 :turn (steer bearing heading) :pitch-turn (steer elevation pitch))
+         (scanner-set bot :heading bearing :arc (min *search-arc* (* 2 (scan-arc (scanner-last bot)))) :pitch elevation)
+         (status-set bot :text "REACQUIRE")))
       (heard
        (let* ((bearing (angles-bearing-to position (cue-position heard))) (distance (angles-distance position (cue-position heard)))
               (elevation (if free (angles-elevation-to position (cue-position heard)) 0d0))
-              (error (min (cue-bearing-error heard) 30d0)) (tick (clock-tick bot))
+              (error (min (cue-bearing-error heard) 30d0))
               (across (* (/ (- (mod tick 5) 2) 2d0) error)) (up (if free (* (/ (- (mod (floor tick 5) 3) 1) 2d0) error) 0d0)))
          (drive-set bot :throttle 0.7d0 :turn (steer bearing heading) :pitch-turn (steer elevation pitch))
          (scanner-set bot :heading (+ bearing across) :arc (scanner-arc-for-reach bot (+ distance 100)) :pitch (+ elevation up))
          (status-set bot :text "CUE" :value distance)))
       (t
        (drive-set bot :throttle 0.5d0 :turn 0.33d0 :pitch-turn (steer 0d0 pitch))
-       (scanner-set bot :heading (angles-normalize (+ (scan-heading (scanner-last bot)) 36)) :arc 40d0
-                    :pitch (if free (* (- (mod (floor (clock-tick bot) 10) 3) 1) 35d0) 0d0))
+       (scanner-set bot :heading (angles-normalize (+ (scan-heading (scanner-last bot)) 36)) :arc *search-arc*
+                    :pitch (if free (* (- (mod (floor tick 10) 3) 1) 35d0) 0d0))
        (status-set bot :text "SEARCH")))
     ;; A simple dodge: vary it, or predict the shooter.
-    (let ((tick (clock-tick bot)))
+    (progn
       (when (and (>= tick *dodge-end*) (find :muzzle (sensors-cues bot) :key #'contact-source))
         (incf *dodges*)
         (setf *dodge-end* (+ tick 10)))
