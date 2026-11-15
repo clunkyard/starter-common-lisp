@@ -7,7 +7,8 @@
 ;;;; clock: tick seconds remaining_ticks
 ;;;; arena: size gravity terrain_kind ground_height(x y)
 ;;;; me: health position velocity heading pitch roll angular_velocity
-;;;;   attitude grounded altitude applied
+;;;;   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+;;;;   from_mount(heading pitch) mount_toward(point)
 ;;;; battery: charge capacity regen sustainable_drive compute
 ;;;;   drive_cost(fraction)
 ;;;; drive: hover_lift
@@ -29,7 +30,8 @@
 ;;;; score: me best armour
 ;;;; angles: normalize(degrees) angle_diff(target current)
 ;;;;   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-;;;;   distance(a b) clamp(value low high)
+;;;;   distance(a b) to_chassis(heading pitch attitude)
+;;;;   from_chassis(heading pitch attitude) clamp(value low high)
 ;;;; raw: number(path) text(path) has(path) flag(path) count(path) line()
 ;;;; Controls: drive.set(throttle turn pitch_turn)
 ;;;;   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -46,8 +48,9 @@
 
 (defun steer (towards current) (angles-clamp (/ (angles-angle-diff towards current) 45d0)))
 
-
-
+;; Dodges taken, and the tick the current one ends.
+(defvar *dodges* 0)
+(defvar *dodge-end* 0)
 
 (defun starter-turn (bot)
   (let* ((position (me-position bot)) (heading (me-heading bot)) (pitch (me-pitch bot))
@@ -58,6 +61,7 @@
       (target
        (let* ((range (contact-range target)) (bearing (contact-bearing target)) (elevation (contact-elevation target))
               (throttle (cond ((> range 350) 0.7d0) ((< range 200) -0.4d0) (t 0.2d0)))
+              ;; gun-lead is the intercept if the target holds course.
               (power (gun-power-for-flight-time bot range 1d0)) (aim (gun-lead bot target power))
               (aim-heading (if aim (solution-heading aim) bearing)) (aim-pitch (if aim (solution-pitch aim) elevation))
               (now (gun-aim-now bot)))
@@ -81,6 +85,18 @@
        (scanner-set bot :heading (angles-normalize (+ (scan-heading (scanner-last bot)) 36)) :arc 40d0
                     :pitch (if free (* (- (mod (floor (clock-tick bot) 10) 3) 1) 35d0) 0d0))
        (status-set bot :text "SEARCH")))
+    ;; A simple dodge: vary it, or predict the shooter.
+    (let ((tick (clock-tick bot)))
+      (when (and (>= tick *dodge-end*) (find :muzzle (sensors-cues bot) :key #'contact-source))
+        (incf *dodges*)
+        (setf *dodge-end* (+ tick 10)))
+      (when (< tick *dodge-end*)
+        ;; Off the line of fire: left, then right next time (turn is positive left, strafe positive right).
+        (let ((left (oddp *dodges*)))
+          (if (eq (match-control bot) :forces)
+              (progn (drive-set bot :throttle 0.5d0) (drive-forces bot :strafe (if left -1d0 1d0)))
+              (drive-set bot :throttle 1d0 :turn (if left 1d0 -1d0)))
+          (status-set bot :text (if left "dodge:left" "dodge:right") :value *dodges*))))
     (when (< (battery-charge bot) (/ (battery-capacity bot) 4))
       (drive-set bot :throttle (* (or (drive-get bot :throttle) 0d0) 0.5d0)))
     (let ((storm (nav-storm bot)) (zone (nav-zone bot)))
